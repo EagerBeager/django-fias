@@ -2,13 +2,26 @@
 from __future__ import unicode_literals, absolute_import
 
 from urllib import urlretrieve, urlcleanup
-from xml.parsers import expat
+
+from django.conf import settings
+from django import db
+from lxml import etree
+
 import datetime
 import rarfile
 import warnings
 
 from fias.models import *
 from fias.config import FIAS_TABLES
+
+
+def _fast_iter(context, func):
+    for event, elem in context:
+        func(elem)
+        elem.clear()
+        while elem.getprevious() is not None:
+            del elem.getparent()[0]
+    del context
 
 
 class FiasFiles(object):
@@ -130,11 +143,12 @@ class BulkCreate(object):
 
     def _create(self):
         self.model.objects.bulk_create(self.objects)
-        del self.objects
         self.objects = []
+        if settings.DEBUG:
+            db.reset_queries()
 
-    def push(self, data):
-        data = self._lower_keys(data)
+    def push(self, raw_data):
+        data = self._lower_keys(raw_data)
 
         key = data[self.pk]
 
@@ -149,12 +163,10 @@ class BulkCreate(object):
                 old_obj.save()
                 self.upd_counter += 1
 
-            del old_obj
-        del data
-
         if self.counter and self.counter % 10000 == 0:
             self._create()
             print ('Created {0} objects'.format(self.counter))
+
 
     def finish(self):
         if self.objects:
@@ -163,35 +175,42 @@ class BulkCreate(object):
         if self.upd_counter:
             print ('Updated {0} objects'.format(self.upd_counter))
 
+    '''
     def __del__(self):
         del self.model
         del self.pk
         del self.objects
         del self.counter
         del self.upd_counter
+    '''
 
 
 _socrbase_bulk = BulkCreate(SocrBase, 'kod_t_st')
 
 
-def _socrbase_row(name, attrib):
-    if name == 'AddressObjectType':
-        _socrbase_bulk.push(attrib)
+def _socrbase_row(elem):
+    if elem.tag == 'AddressObjectType':
+        _socrbase_bulk.push(elem.attrib)
 
 
 _normdoc_bulk = BulkCreate(NormDoc, 'normdocid')
 
 
-def _normdoc_row(name, attrib):
-    if name == 'NormativeDocument':
-        _normdoc_bulk.push(attrib)
+def _normdoc_row(elem):
+    if elem.tag == 'NormativeDocument':
+        _normdoc_bulk.push(elem.attrib)
 
 
 _addr_obj_bulk = BulkCreate(AddrObj, 'aoguid', 'updatedate')
+#_addr_obj_bulk = BulkCreate(AddrObj, 'aoguid')
 
 
-def _addrobj_row(name, attrib):
-    if name == 'Object':
+def _addrobj_row(elem):
+
+    attrib = {}
+
+    attrib.update(elem.attrib)
+    if elem.tag == 'Object':
 
         if attrib.get('LIVESTATUS', '0') != '1':
             return
@@ -212,11 +231,13 @@ def _addrobj_row(name, attrib):
         _addr_obj_bulk.push(attrib)
 
 
+
+
 _house_bulk = BulkCreate(House, 'houseguid', 'updatedate')
 
 
-def _house_row(name, attrib):
-    if name == 'House':
+def _house_row(elem):
+    if elem.tag == 'House':
         #TODO: реализовать
         return
 
@@ -232,44 +253,64 @@ def _process_table(table, f, update=False):
 
     print ('Processing table `{0}`...'.format(table))
 
-    p = expat.ParserCreate()
-    bulk = None
+    serializeElementHandler = None
+
+    #bulk = None
 
     if table == 'socrbase':
         if not update:
             SocrBase.objects.all().delete()
 
-        p.StartElementHandler = _socrbase_row
+        serializeElementHandler = _socrbase_row
+
         bulk = _socrbase_bulk
 
     elif table == 'normdoc':
         if not update:
             NormDoc.objects.all().delete()
 
-        p.StartElementHandler = _normdoc_row
+        #p.StartElementHandler = _normdoc_row
+
+        serializeElementHandler = _normdoc_row
+
         bulk = _normdoc_bulk
     elif table == 'addrobj':
         if not update:
             AddrObj.objects.all().delete()
 
-        p.StartElementHandler = _addrobj_row
+        #p.StartElementHandler = _addrobj_row
+
+        serializeElementHandler = _addrobj_row
+
         bulk = _addr_obj_bulk
     elif table == 'house':
         if not update:
             House.objects.all().delete()
 
-        p.StartElementHandler = _house_row
+        #p.StartElementHandler = _house_row
+
+        serializeElementHandler = _house_row
+
+
         bulk = _house_bulk
         #TODO: убрать как только будет реализовано до конца (см. выше)
         return
     else:
         return
 
-    p.ParseFile(f)
+    context = etree.iterparse(f, events=('end',),)
+
+    _fast_iter(context,
+               lambda elem: serializeElementHandler(elem)
+    )
+
+    #p.ParseFile(f)
+
+
     bulk.finish()
-    del p
-    del f
-    del bulk
+    #del p
+    #del f
+    #del bulk
 
     print ('Processing table `{0}` is finished'.format(table))
 
